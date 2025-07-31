@@ -437,9 +437,9 @@ class IrAttachment(models.Model):
                         path = attachment._move_attachment_to_store()
                         if path:
                             files_to_clean.append(path)
-                except psycopg2.OperationalError:
+                except Exception as e:
                     _logger.error(
-                        "Could not migrate attachment %s to S3", attachment_id
+                        "Could not migrate attachment %s to S3 due to error: %s", attachment_id, e
                     )
 
             # delete the files from the filesystem once we know the changes
