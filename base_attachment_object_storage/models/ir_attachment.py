@@ -210,7 +210,7 @@ class IrAttachment(models.Model):
         raise NotImplementedError("No implementation for %s" % (storage,))
 
     def _store_file_write(self, key, bin_data):
-        storage = self.storage()
+        storage = self._storage()
         raise NotImplementedError("No implementation for %s" % (storage,))
 
     def _store_file_delete(self, fname):
