@@ -6,17 +6,23 @@ import os
 import threading
 import uuid
 
+import pythonjsonlogger
+
 from odoo import http
 
 from .strtobool import strtobool
 
 _logger = logging.getLogger(__name__)
 
-try:
-    from pythonjsonlogger import jsonlogger
-except ImportError:
+# Module ``jsonlogger`` of package ``python-json-logger`` is deprecated since version
+# 3.1.0, keep it for backward compatibility
+if hasattr(pythonjsonlogger, "json"):
+    jsonlogger = pythonjsonlogger.json
+elif hasattr(pythonjsonlogger, "jsonlogger"):
+    jsonlogger = pythonjsonlogger.jsonlogger
+else:
     jsonlogger = None  # noqa
-    _logger.debug("Cannot 'import pythonjsonlogger'.")
+    _logger.debug("Cannot import 'json' or 'jsonlogger' from 'pythonjsonlogger'.")
 
 
 def is_true(strval):
@@ -29,7 +35,7 @@ class OdooJsonFormatter(jsonlogger.JsonFormatter):
         record.dbname = getattr(threading.current_thread(), "dbname", "?")
         record.request_id = getattr(threading.current_thread(), "request_uuid", None)
         record.uid = getattr(threading.current_thread(), "uid", None)
-        _super = super(OdooJsonFormatter, self)
+        _super = super()
         return _super.add_fields(log_record, record, message_dict)
 
 
