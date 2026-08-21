@@ -134,7 +134,7 @@ class IrAttachment(models.Model):
     @api.model
     def _store_file_write(self, key, bin_data):
         location = self.env.context.get("storage_location") or self._storage()
-        if location == "s3" and not self.env.company.s3_test:
+        if location == "s3":
             bucket = self._get_s3_bucket()
             obj = bucket.Object(key=key)
             with io.BytesIO() as file:
@@ -156,7 +156,7 @@ class IrAttachment(models.Model):
 
     @api.model
     def _store_file_delete(self, fname):
-        if fname.startswith("s3://") and not self.env.company.s3_test:
+        if fname.startswith("s3://"):
             s3uri = S3Uri(fname)
             bucket_name = s3uri.bucket()
             item_name = s3uri.item()

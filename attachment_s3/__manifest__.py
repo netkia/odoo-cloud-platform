@@ -10,9 +10,7 @@
     "license": "AGPL-3",
     "category": "Knowledge Management",
     "depends": ["base", "base_attachment_object_storage"],
-    "data": [
-        "views/res_company_views.xml",
-    ],
+    "data": [],
     "external_dependencies": {
         "python": ["boto3"],
     },

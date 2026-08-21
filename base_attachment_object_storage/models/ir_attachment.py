@@ -220,7 +220,7 @@ class IrAttachment(models.Model):
     @api.model
     def _file_write(self, bin_data, checksum):
         location = self.env.context.get("storage_location") or self._storage()
-        if location in self._get_stores():
+        if location in self._get_stores() and not self.env.company.object_storage_test:
             key = self.env.context.get("force_storage_key")
             if not key:
                 key = self._compute_checksum(bin_data)
@@ -231,7 +231,7 @@ class IrAttachment(models.Model):
 
     @api.model
     def _file_delete(self, fname):
-        if self._is_file_from_a_store(fname):
+        if self._is_file_from_a_store(fname) and not self.env.company.object_storage_test:
             cr = self.env.cr
             # using SQL to include files hidden through unlink or due to record
             # rules

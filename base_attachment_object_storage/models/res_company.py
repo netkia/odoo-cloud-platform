@@ -5,7 +5,7 @@ from odoo import _, fields, models
 class ResCompany(models.Model):
     _inherit = "res.company"
 
-    s3_test = fields.Boolean(
+    object_storage_test = fields.Boolean(
         default=False,
-        help="Test S3 connection and bucket access",
+        help="Test Object Storage connection",
     )

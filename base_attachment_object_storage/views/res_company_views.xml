@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <odoo>
-    <record id="view_company_s3_form" model="ir.ui.view">
-        <field name="name">res.company.s3.form</field>
+    <record id="view_company_object_storage_form" model="ir.ui.view">
+        <field name="name">res.company.object.storage.form</field>
         <field name="model">res.company</field>
         <field name="inherit_id" ref="base.view_company_form" />
         <field name="arch" type="xml">
             <notebook position="inside">
-                <page name="s3" string="S3">
-                    <group name="s3_enabled">
-                        <field name="s3_test" />
+                <page name="object_storage" string="Object Storage">
+                    <group name="object_storage_enabled">
+                        <field name="object_storage_test" />
                     </group>
                 </page>
             </notebook>
