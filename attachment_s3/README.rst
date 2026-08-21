@@ -56,3 +56,43 @@ Limitations
 * You need to call ``env['ir.attachment'].force_storage()`` after
   having changed the ``ir_attachment.location`` configuration in order to
   migrate the existing attachments to S3.
+
+Scheduled incremental migration
+--------------------------------
+
+For large filestores, run the migration from an external scheduler using Odoo
+shell instead of a long HTTP request. For example, a deployment wrapper can run:
+
+.. code-block:: shell
+
+  flock -n /var/lock/odoo-s3-migration.lock \
+    docker-compose run --rm -T odoo \
+    odoo shell -d "$DB_NAME" --no-http < migrate_attachments.py
+
+Where ``migrate_attachments.py`` contains:
+
+.. code-block:: python
+
+  result = env["ir.attachment"].sudo()._force_storage_to_object_storage(
+     new_cr=True,
+     batch_size=500,
+     max_batches=20,
+     max_duration_seconds=6 * 60 * 60,
+  )
+  log(result)
+
+Adapt the command and configuration file to the deployment. Schedule it to
+finish before the working day and start with small batches. Increase the limits
+only after observing memory, S3 traffic, failures, and batch duration.
+
+Once no attachments remain pending, validate every referenced S3 object:
+
+.. code-block:: python
+
+  report = env["ir.attachment"].sudo().validate_object_storage(batch_size=500)
+  log(report)
+
+Enable bucket versioning and take a consistent database and filestore backup
+before the first migration. The original filestore is not deleted by this
+process; follow the validation and retirement procedure documented by
+``base_attachment_object_storage``.

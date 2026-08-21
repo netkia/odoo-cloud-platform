@@ -5,6 +5,7 @@
 import io
 import logging
 import os
+import time
 from urllib.parse import urlsplit
 
 from odoo import _, api, exceptions, models
@@ -15,11 +16,20 @@ _logger = logging.getLogger(__name__)
 
 try:
     import boto3
-    from botocore.exceptions import ClientError, EndpointConnectionError
+    from botocore.exceptions import (
+        ClientError,
+        ConnectionClosedError,
+        ConnectTimeoutError,
+        EndpointConnectionError,
+        ReadTimeoutError,
+    )
 except ImportError:
     boto3 = None  # noqa
     ClientError = None  # noqa
+    ConnectionClosedError = None  # noqa
+    ConnectTimeoutError = None  # noqa
     EndpointConnectionError = None  # noqa
+    ReadTimeoutError = None  # noqa
     _logger.debug("Cannot 'import boto3'.")
 
 
@@ -30,7 +40,7 @@ class IrAttachment(models.Model):
         return ["s3"] + super()._get_stores()
 
     @api.model
-    def _get_s3_bucket(self, name=None):
+    def _get_s3_bucket(self, name=None, create=True, raw_errors=False):
         """Connect to S3 and return the bucket
 
         The following environment variables can be set:
@@ -92,11 +102,13 @@ class IrAttachment(models.Model):
             if error_code == "404":
                 exists = False
         except EndpointConnectionError as error:
+            if raw_errors:
+                raise
             # log verbose error from s3, return short message for user
             msg = _logger.exception("Error during connection on S3")
             raise exceptions.UserError(str(error)) from None
 
-        if not exists:
+        if not exists and create:
             if not region_name:
                 bucket = s3.create_bucket(Bucket=bucket_name)
             else:
@@ -105,6 +117,56 @@ class IrAttachment(models.Model):
                     CreateBucketConfiguration={"LocationConstraint": region_name},
                 )
         return bucket
+
+    @api.model
+    def _object_storage_file_info(self, fname, max_retries=3):
+        if not fname.startswith("s3://"):
+            return super()._object_storage_file_info(fname)
+        if max_retries <= 0:
+            raise ValueError("max_retries must be positive")
+
+        s3uri = S3Uri(fname)
+        transient_errors = (
+            ConnectionClosedError,
+            ConnectTimeoutError,
+            EndpointConnectionError,
+            ReadTimeoutError,
+        )
+        transient_codes = {
+            "InternalError",
+            "RequestTimeout",
+            "ServiceUnavailable",
+            "SlowDown",
+        }
+        for attempt in range(1, max_retries + 1):
+            try:
+                bucket = self._get_s3_bucket(
+                    name=s3uri.bucket(), create=False, raw_errors=True
+                )
+                response = bucket.meta.client.head_object(
+                    Bucket=bucket.name, Key=s3uri.item()
+                )
+                return {"size": response.get("ContentLength")}
+            except ClientError as error:
+                error_code = str(error.response.get("Error", {}).get("Code", ""))
+                status_code = error.response.get("ResponseMetadata", {}).get(
+                    "HTTPStatusCode", 0
+                )
+                if error_code in {"404", "NoSuchBucket", "NoSuchKey", "NotFound"}:
+                    raise FileNotFoundError(fname) from error
+                if error_code in {"401", "403", "AccessDenied", "Forbidden"}:
+                    raise PermissionError(fname) from error
+                if error_code not in transient_codes and status_code < 500:
+                    raise
+                if attempt == max_retries:
+                    raise
+            except transient_errors:
+                if attempt == max_retries:
+                    raise
+
+            time.sleep(2 ** (attempt - 1))
+
+        raise RuntimeError("Could not validate %s" % fname)
 
     @api.model
     def _store_file_read(self, fname):

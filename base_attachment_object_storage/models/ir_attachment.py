@@ -23,23 +23,6 @@ def is_true(strval):
     return bool(strtobool(strval or "0"))
 
 
-def clean_fs(files):
-    _logger.info("cleaning old files from filestore")
-    for full_path in files:
-        if os.path.exists(full_path):
-            try:
-                os.unlink(full_path)
-            except OSError:
-                _logger.info(
-                    "_file_delete could not unlink %s", full_path, exc_info=True
-                )
-            except OSError:
-                # Harmless and needed for race conditions
-                _logger.info(
-                    "_file_delete could not unlink %s", full_path, exc_info=True
-                )
-
-
 class IrAttachment(models.Model):
     _inherit = "ir.attachment"
 
@@ -231,7 +214,10 @@ class IrAttachment(models.Model):
 
     @api.model
     def _file_delete(self, fname):
-        if self._is_file_from_a_store(fname) and not self.env.company.object_storage_test:
+        if (
+            self._is_file_from_a_store(fname)
+            and not self.env.company.object_storage_test
+        ):
             cr = self.env.cr
             # using SQL to include files hidden through unlink or due to record
             # rules
@@ -386,67 +372,264 @@ class IrAttachment(models.Model):
                     )
 
     @api.model
-    def _force_storage_to_object_storage(self, new_cr=False):
-        _logger.info("migrating files to the object storage")
+    def _object_storage_migration_domain(self, storage):
+        # The explicit res_field condition prevents ir.attachment._search from
+        # implicitly restricting the migration to non-field attachments.
+        not_in_storage = normalize_domain(
+            [
+                "!",
+                ("store_fname", "=like", f"{storage}://%"),
+                "|",
+                ("res_field", "=", False),
+                ("res_field", "!=", False),
+            ]
+        )
+        forced_database = normalize_domain(
+            self._store_in_db_instead_of_object_storage_domain()
+        )
+        requires_migration = OR(
+            [
+                [("store_fname", "!=", False)],
+                AND(
+                    [
+                        [("db_datas", "!=", False)],
+                        ["!"] + forced_database,
+                    ]
+                ),
+            ]
+        )
+        return AND([not_in_storage, requires_migration])
+
+    @api.model
+    def _force_storage_to_object_storage(
+        self,
+        new_cr=False,
+        batch_size=500,
+        max_batches=20,
+        max_duration_seconds=None,
+    ):
+        """Migrate a bounded number of attachments to the object storage.
+
+        Committed attachments are excluded from subsequent executions by the
+        search domain, so no persistent migration cursor is required.
+        """
+        if batch_size <= 0 or max_batches <= 0:
+            raise ValueError("batch_size and max_batches must be positive")
+        if max_duration_seconds is not None and max_duration_seconds <= 0:
+            raise ValueError("max_duration_seconds must be positive")
+
+        _logger.info(
+            "migrating files to the object storage "
+            "(batch_size=%d, max_batches=%d, max_duration_seconds=%s)",
+            batch_size,
+            max_batches,
+            max_duration_seconds,
+        )
         storage = self.env.context.get("storage_location") or self._storage()
         if self.is_storage_disabled(storage):
             return
-        # The weird "res_field = False OR res_field != False" domain
-        # is required! It's because of an override of _search in ir.attachment
-        # which adds ('res_field', '=', False) when the domain does not
-        # contain 'res_field'.
-        # https://github.com/odoo/odoo/blob/9032617120138848c63b3cfa5d1913c5e5ad76db/odoo/addons/base/ir/ir_attachment.py#L344-L347  # noqa: B950
-
-        domain = [
-            "!",
-            ("store_fname", "=like", f"{storage}://%"),
-            "|",
-            ("res_field", "=", False),
-            ("res_field", "!=", False),
-        ]
+        domain = self._object_storage_migration_domain(storage)
         # We do a copy of the environment so we can workaround the cache issue
         # below. We do not create a new cursor by default because it causes
         # serialization issues due to concurrent updates on attachments during
         # the installation
         with self.do_in_new_env(new_cr=new_cr) as new_env:
-            model_env = new_env["ir.attachment"]
-            ids = model_env.search(domain).ids
-            files_to_clean = []
-            for attachment_id in ids:
-                try:
-                    with new_env.cr.savepoint():
-                        # check that no other transaction has
-                        # locked the row, don't send a file to storage
-                        # in that case
-                        self.env.cr.execute(
-                            "SELECT id "
-                            "FROM ir_attachment "
-                            "WHERE id = %s "
-                            "FOR UPDATE NOWAIT",
-                            (attachment_id,),
-                            log_exceptions=False,
+            model_env = new_env["ir.attachment"].with_context(prefetch_fields=False)
+            started_at = time.monotonic()
+            last_attachment_id = 0
+            processed = 0
+            skipped = 0
+            failed = 0
+            batch_number = 0
+            stop_reason = "max_batches"
+
+            while batch_number < max_batches:
+                elapsed = time.monotonic() - started_at
+                if max_duration_seconds is not None and elapsed >= max_duration_seconds:
+                    stop_reason = "max_duration_seconds"
+                    break
+
+                ids = model_env.search(
+                    domain + [("id", ">", last_attachment_id)],
+                    limit=batch_size,
+                    order="id",
+                ).ids
+                if not ids:
+                    stop_reason = "no_pending_attachments"
+                    break
+
+                batch_number += 1
+                batch_started_at = time.monotonic()
+                batch_processed = 0
+                batch_skipped = 0
+                batch_failed = 0
+                for attachment_id in ids:
+                    try:
+                        with new_env.cr.savepoint():
+                            # Do not wait for attachments used by another
+                            # transaction; they will be retried on a later run.
+                            new_env.cr.execute(
+                                "SELECT id "
+                                "FROM ir_attachment "
+                                "WHERE id = %s "
+                                "FOR UPDATE NOWAIT",
+                                (attachment_id,),
+                                log_exceptions=False,
+                            )
+
+                            # Avoid prefetching the contents of every attachment
+                            # when reading the computed datas field.
+                            new_env.clear()
+                            attachment = model_env.browse(attachment_id)
+                            attachment._move_attachment_to_store()
+                            batch_processed += 1
+                    except psycopg2.errors.LockNotAvailable:
+                        batch_skipped += 1
+                        _logger.info(
+                            "Skipping locked attachment %s; it will be retried",
+                            attachment_id,
+                        )
+                    except Exception as error:
+                        batch_failed += 1
+                        _logger.error(
+                            "Could not migrate attachment %s to %s due to error: %s",
+                            attachment_id,
+                            storage,
+                            error,
                         )
 
-                        # This is a trick to avoid having the 'datas'
-                        # function fields computed for every attachment on
-                        # each iteration of the loop. The former issue
-                        # being that it reads the content of the file of
-                        # ALL the attachments on each loop.
-                        new_env.clear()
-                        attachment = model_env.browse(attachment_id)
-                        path = attachment._move_attachment_to_store()
-                        if path:
-                            files_to_clean.append(path)
-                except Exception as e:
-                    _logger.error(
-                        "Could not migrate attachment %s to S3 due to error: %s", attachment_id, e
-                    )
-
-            # delete the files from the filesystem once we know the changes
-            # have been committed in ir.attachment
-            if files_to_clean:
+                # A completed batch is the durable checkpoint. The filestore
+                # is deliberately retained until a separate validation and
+                # cleanup operation has completed.
                 new_env.cr.commit()
-                clean_fs(files_to_clean)
+                processed += batch_processed
+                skipped += batch_skipped
+                failed += batch_failed
+                last_attachment_id = ids[-1]
+                _logger.info(
+                    "Object storage migration batch %d committed: selected=%d, "
+                    "processed=%d, skipped=%d, failed=%d, last_id=%d, "
+                    "duration=%.2fs",
+                    batch_number,
+                    len(ids),
+                    batch_processed,
+                    batch_skipped,
+                    batch_failed,
+                    last_attachment_id,
+                    time.monotonic() - batch_started_at,
+                )
+
+            _logger.info(
+                "Object storage migration stopped: reason=%s, batches=%d, "
+                "processed=%d, skipped=%d, failed=%d, duration=%.2fs",
+                stop_reason,
+                batch_number,
+                processed,
+                skipped,
+                failed,
+                time.monotonic() - started_at,
+            )
+            return {
+                "reason": stop_reason,
+                "batches": batch_number,
+                "processed": processed,
+                "skipped": skipped,
+                "failed": failed,
+                "duration": time.monotonic() - started_at,
+            }
+
+    @api.model
+    def _object_storage_file_info(self, fname):
+        """Return backend metadata for an object storage URI."""
+        storage = fname.partition("://")[0]
+        raise NotImplementedError("No implementation for %s" % (storage,))
+
+    @api.model
+    def validate_object_storage(self, batch_size=500):
+        """Validate every unique object URI referenced by attachments."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+
+        storage = self.env.context.get("storage_location") or self._storage()
+        if self.is_storage_disabled(storage):
+            return
+        if storage not in self._get_stores():
+            raise exceptions.UserError(
+                _("Storage '%s' is not an object storage backend.") % storage
+            )
+
+        report = {
+            "storage": storage,
+            "pending": self.search_count(
+                self._object_storage_migration_domain(storage)
+            ),
+            "checked": 0,
+            "valid": 0,
+            "missing": 0,
+            "inaccessible": 0,
+            "size_mismatch": 0,
+        }
+        last_fname = ""
+        while True:
+            self.env.cr.execute(
+                "SELECT store_fname, MAX(file_size) "
+                "FROM ir_attachment "
+                "WHERE store_fname LIKE %s AND store_fname > %s "
+                "GROUP BY store_fname "
+                "ORDER BY store_fname "
+                "LIMIT %s",
+                (f"{storage}://%", last_fname, batch_size),
+            )
+            objects = self.env.cr.fetchall()
+            if not objects:
+                break
+
+            for fname, expected_size in objects:
+                report["checked"] += 1
+                try:
+                    info = self._object_storage_file_info(fname)
+                except FileNotFoundError:
+                    report["missing"] += 1
+                    _logger.error("Object storage file is missing: %s", fname)
+                except (PermissionError, exceptions.AccessError):
+                    report["inaccessible"] += 1
+                    _logger.exception("Object storage file is inaccessible: %s", fname)
+                except Exception:
+                    report["inaccessible"] += 1
+                    _logger.exception(
+                        "Could not validate object storage file: %s", fname
+                    )
+                else:
+                    actual_size = info.get("size")
+                    if (
+                        expected_size is not None
+                        and actual_size is not None
+                        and expected_size != actual_size
+                    ):
+                        report["size_mismatch"] += 1
+                        _logger.error(
+                            "Object storage file size mismatch for %s: "
+                            "expected=%s, actual=%s",
+                            fname,
+                            expected_size,
+                            actual_size,
+                        )
+                    else:
+                        report["valid"] += 1
+                last_fname = fname
+
+            _logger.info(
+                "Object storage validation progress: checked=%d, valid=%d, "
+                "missing=%d, inaccessible=%d, size_mismatch=%d",
+                report["checked"],
+                report["valid"],
+                report["missing"],
+                report["inaccessible"],
+                report["size_mismatch"],
+            )
+
+        _logger.info("Object storage validation completed: %s", report)
+        return report
 
     def _get_stores(self):
         """To get the list of stores activated in the system"""
