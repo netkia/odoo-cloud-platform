@@ -395,7 +395,7 @@ class IrAttachment(models.Model):
         _logger.info("migrating files to the object storage")
         storage = self.env.context.get("storage_location") or self._storage()
         if self.is_storage_disabled(storage):
-            return
+            return False
         # The weird "res_field = False OR res_field != False" domain
         # is required! It's because of an override of _search in ir.attachment
         # which adds ('res_field', '=', False) when the domain does not
@@ -415,6 +415,7 @@ class IrAttachment(models.Model):
         # below. We do not create a new cursor by default because it causes
         # serialization issues due to concurrent updates on attachments during
         # the installation
+        processed = 0
         with self.do_in_new_env(new_cr=new_cr) as new_env:
             model_env = new_env["ir.attachment"]
             if num_attachments:
@@ -423,6 +424,8 @@ class IrAttachment(models.Model):
                 ).ids
             else:
                 ids = model_env.search(domain, order="checksum, id").ids
+            if not ids:
+                return False
             files_to_clean = {}
             for attachment_id in ids:
                 try:
@@ -430,7 +433,7 @@ class IrAttachment(models.Model):
                         # check that no other transaction has
                         # locked the row, don't send a file to storage
                         # in that case
-                        self.env.cr.execute(
+                        new_env.cr.execute(
                             "SELECT id "
                             "FROM ir_attachment "
                             "WHERE id = %s "
@@ -450,6 +453,8 @@ class IrAttachment(models.Model):
                         if file_to_clean:
                             fname, path = file_to_clean
                             files_to_clean[fname] = path
+                        if attachment.store_fname.startswith(f"{storage}://"):
+                            processed += 1
                 except Exception as e:
                     model_env.browse(attachment_id).write({"storage_error": str(e)})
                     _logger.error(
@@ -480,6 +485,7 @@ class IrAttachment(models.Model):
                         if fname not in referenced_fnames
                     ]
                     clean_fs(safe_paths)
+        return processed
 
     def _get_stores(self):
         """To get the list of stores activated in the system"""
@@ -487,7 +493,11 @@ class IrAttachment(models.Model):
 
     @api.model
     def storage_to_object_storage(
-        self, num_attachments=None, force_clear=False, skip_errors=False
+        self,
+        num_attachments=None,
+        force_clear=False,
+        skip_errors=False,
+        with_batch=False,
     ):
         if not self.env["res.users"].browse(self.env.uid)._is_admin():
             raise exceptions.AccessError(
@@ -495,10 +505,13 @@ class IrAttachment(models.Model):
             )
         location = self.env.context.get("storage_location") or self._storage()
         if location in self._get_stores():
-            self._force_storage_to_object_storage(
-                num_attachments=num_attachments,
-                force_clear=force_clear,
-                skip_errors=skip_errors,
-            )
+            while True:
+                result = self._force_storage_to_object_storage(
+                    num_attachments=num_attachments,
+                    force_clear=force_clear,
+                    skip_errors=skip_errors,
+                )
+                if not with_batch or not result:
+                    break
             return True
         return False
