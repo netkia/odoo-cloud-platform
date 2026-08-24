@@ -7,10 +7,8 @@ import os
 import time
 from contextlib import closing, contextmanager
 
-import psycopg2
-
 import odoo
-from odoo import _, api, exceptions, models
+from odoo import _, api, exceptions, fields, models
 from odoo.osv.expression import AND, OR, normalize_domain
 from odoo.tools.safe_eval import const_eval
 
@@ -42,6 +40,8 @@ def clean_fs(files):
 
 class IrAttachment(models.Model):
     _inherit = "ir.attachment"
+
+    storage_error = fields.Char()
 
     @staticmethod
     def is_storage_disabled(storage=None, log=True):
@@ -231,7 +231,10 @@ class IrAttachment(models.Model):
 
     @api.model
     def _file_delete(self, fname):
-        if self._is_file_from_a_store(fname) and not self.env.company.object_storage_test:
+        if (
+            self._is_file_from_a_store(fname)
+            and not self.env.company.object_storage_test
+        ):
             cr = self.env.cr
             # using SQL to include files hidden through unlink or due to record
             # rules
@@ -299,10 +302,11 @@ class IrAttachment(models.Model):
                 }
             )
             _logger.info("moved %s on the object storage", fname)
-            return self._full_path(fname)
+            return fname, self._full_path(fname)
         elif self.db_datas:
             _logger.info("moving on the object storage from database")
             self.write({"datas": self.datas})
+        return False
 
     @api.model
     def force_storage(self):
@@ -386,7 +390,9 @@ class IrAttachment(models.Model):
                     )
 
     @api.model
-    def _force_storage_to_object_storage(self, new_cr=False):
+    def _force_storage_to_object_storage(
+        self, new_cr=False, num_attachments=None, force_clear=True, skip_errors=False
+    ):
         _logger.info("migrating files to the object storage")
         storage = self.env.context.get("storage_location") or self._storage()
         if self.is_storage_disabled(storage):
@@ -404,14 +410,21 @@ class IrAttachment(models.Model):
             ("res_field", "=", False),
             ("res_field", "!=", False),
         ]
+        if not skip_errors:
+            domain = AND([domain, [("storage_error", "=", False)]])
         # We do a copy of the environment so we can workaround the cache issue
         # below. We do not create a new cursor by default because it causes
         # serialization issues due to concurrent updates on attachments during
         # the installation
         with self.do_in_new_env(new_cr=new_cr) as new_env:
             model_env = new_env["ir.attachment"]
-            ids = model_env.search(domain).ids
-            files_to_clean = []
+            if num_attachments:
+                ids = model_env.search(
+                    domain, limit=num_attachments, order="checksum, id"
+                ).ids
+            else:
+                ids = model_env.search(domain, order="checksum, id").ids
+            files_to_clean = {}
             for attachment_id in ids:
                 try:
                     with new_env.cr.savepoint():
@@ -434,20 +447,59 @@ class IrAttachment(models.Model):
                         # ALL the attachments on each loop.
                         new_env.clear()
                         attachment = model_env.browse(attachment_id)
-                        path = attachment._move_attachment_to_store()
-                        if path:
-                            files_to_clean.append(path)
+                        file_to_clean = attachment._move_attachment_to_store()
+                        if file_to_clean:
+                            fname, path = file_to_clean
+                            files_to_clean[fname] = path
                 except Exception as e:
+                    model_env.browse(attachment_id).write({"storage_error": str(e)})
                     _logger.error(
-                        "Could not migrate attachment %s to S3 due to error: %s", attachment_id, e
+                        "Could not migrate attachment %s to S3 due to error: %s",
+                        attachment_id,
+                        e,
                     )
 
             # delete the files from the filesystem once we know the changes
             # have been committed in ir.attachment
             if files_to_clean:
                 new_env.cr.commit()
-                clean_fs(files_to_clean)
+                if force_clear:
+                    referenced_fnames = set(
+                        model_env.search(
+                            [
+                                ("store_fname", "in", list(files_to_clean)),
+                                "|",
+                                ("res_field", "=", False),
+                                ("res_field", "!=", False),
+                            ]
+                        ).mapped("store_fname")
+                    )
+
+                    safe_paths = [
+                        path
+                        for fname, path in files_to_clean.items()
+                        if fname not in referenced_fnames
+                    ]
+                    clean_fs(safe_paths)
 
     def _get_stores(self):
         """To get the list of stores activated in the system"""
         return []
+
+    @api.model
+    def storage_to_object_storage(
+        self, num_attachments=None, force_clear=False, skip_errors=False
+    ):
+        if not self.env["res.users"].browse(self.env.uid)._is_admin():
+            raise exceptions.AccessError(
+                _("Only administrators can execute this action.")
+            )
+        location = self.env.context.get("storage_location") or self._storage()
+        if location in self._get_stores():
+            self._force_storage_to_object_storage(
+                num_attachments=num_attachments,
+                force_clear=force_clear,
+                skip_errors=skip_errors,
+            )
+            return True
+        return False
