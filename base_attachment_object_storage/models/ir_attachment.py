@@ -390,7 +390,12 @@ class IrAttachment(models.Model):
 
     @api.model
     def _force_storage_to_object_storage(
-        self, new_cr=False, num_attachments=None, force_clear=True, skip_errors=False
+        self,
+        new_cr=False,
+        num_attachments=None,
+        force_clear=True,
+        skip_errors=False,
+        skip_db_storage=False,
     ):
         _logger.info("migrating files to the object storage")
         storage = self.env.context.get("storage_location") or self._storage()
@@ -409,6 +414,11 @@ class IrAttachment(models.Model):
             ("res_field", "=", False),
             ("res_field", "!=", False),
         ]
+        if skip_db_storage:
+            force_db_domain = normalize_domain(
+                self._store_in_db_instead_of_object_storage_domain()
+            )
+            domain = AND([domain, ["!"] + force_db_domain])
         if not skip_errors:
             domain = AND([domain, [("storage_error", "=", False)]])
         # We do a copy of the environment so we can workaround the cache issue
@@ -453,7 +463,10 @@ class IrAttachment(models.Model):
                         if file_to_clean:
                             fname, path = file_to_clean
                             files_to_clean[fname] = path
-                        if attachment.store_fname.startswith(f"{storage}://"):
+                        attachment.invalidate_cache(["store_fname"])
+                        if attachment.store_fname and attachment.store_fname.startswith(
+                            f"{storage}://"
+                        ):
                             processed += 1
                 except Exception as e:
                     model_env.browse(attachment_id).write({"storage_error": str(e)})
@@ -498,6 +511,7 @@ class IrAttachment(models.Model):
         force_clear=False,
         skip_errors=False,
         with_batch=False,
+        skip_db_storage=False,
     ):
         if not self.env["res.users"].browse(self.env.uid)._is_admin():
             raise exceptions.AccessError(
@@ -510,6 +524,7 @@ class IrAttachment(models.Model):
                     num_attachments=num_attachments,
                     force_clear=force_clear,
                     skip_errors=skip_errors,
+                    skip_db_storage=skip_db_storage,
                 )
                 if not with_batch or not result:
                     break
