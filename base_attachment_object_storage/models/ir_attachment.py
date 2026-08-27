@@ -463,17 +463,21 @@ class IrAttachment(models.Model):
                         if file_to_clean:
                             fname, path = file_to_clean
                             files_to_clean[fname] = path
-                        attachment.invalidate_cache(["store_fname"])
+                        attachment.invalidate_recordset(["store_fname"])
                         if attachment.store_fname and attachment.store_fname.startswith(
                             f"{storage}://"
                         ):
                             processed += 1
-                except Exception as e:
-                    model_env.browse(attachment_id).write({"storage_error": str(e)})
-                    _logger.error(
-                        "Could not migrate attachment %s to S3 due to error: %s",
+                except Exception as error:
+                    error_message = str(error) or repr(error)
+                    model_env.browse(attachment_id).write(
+                        {"storage_error": error_message}
+                    )
+                    _logger.exception(
+                        "Could not migrate attachment %s to S3 due to %s: %s",
                         attachment_id,
-                        e,
+                        type(error).__name__,
+                        error_message,
                     )
 
             # delete the files from the filesystem once we know the changes
