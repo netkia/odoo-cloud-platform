@@ -13,7 +13,7 @@
     "website": "https://github.com/camptocamp/odoo-cloud-platform",
     "data": [
         "data/res_config_settings_data.xml",
-        "views/res_company_views.xml",
+        # "views/res_company_views.xml",
     ],
     "installable": True,
     "auto_install": True,
