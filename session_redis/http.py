@@ -3,6 +3,7 @@
 
 import logging
 import os
+import re
 
 from odoo import http
 from odoo.tools import config
@@ -62,14 +63,27 @@ def session_store(self):
 
 def purge_fs_sessions(path):
     for fname in os.listdir(path):
-        path = os.path.join(path, fname)
+        entry_path = os.path.join(path, fname)
         try:
-            os.unlink(path)
+            if os.path.isdir(entry_path) and re.fullmatch(r"[a-f0-9]{2}", fname):
+                for session_name in os.listdir(entry_path):
+                    if re.fullmatch(
+                        r"[a-f0-9]{40}", session_name
+                    ) and session_name.startswith(fname):
+                        os.unlink(os.path.join(entry_path, session_name))
+                if not os.listdir(entry_path):
+                    os.rmdir(entry_path)
+            elif os.path.isfile(entry_path):
+                os.unlink(entry_path)
         except OSError:
-            _logger.warning("OS Error during purge of redis sessions.")
+            _logger.warning(
+                "OS Error during purge of redis sessions: %s", entry_path, exc_info=True
+            )
 
 
 if is_true(os.environ.get("ODOO_SESSION_REDIS")):
+    if redis is None:
+        raise ImportError("The redis Python package is required for session_redis")
     if sentinel_host:
         _logger.debug(
             "HTTP sessions stored in Redis with prefix '%s'. Using Sentinel on %s:%s",

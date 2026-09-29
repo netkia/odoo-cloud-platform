@@ -33,11 +33,11 @@ class RedisSessionStore(SessionStore):
         if expiration is None:
             self.expiration = DEFAULT_SESSION_TIMEOUT
         else:
-            self.expiration = expiration
+            self.expiration = int(expiration)
         if anon_expiration is None:
             self.anon_expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
         else:
-            self.anon_expiration = anon_expiration
+            self.anon_expiration = int(anon_expiration)
         self.prefix = "session:"
         if prefix:
             self.prefix = "%s:%s:" % (self.prefix, prefix)
@@ -69,8 +69,7 @@ class RedisSessionStore(SessionStore):
         data = json.dumps(dict(session), cls=json_encoding.SessionEncoder).encode(
             "utf-8"
         )
-        if self.redis.set(key, data):
-            return self.redis.expire(key, expiration)
+        return self.redis.set(key, data, ex=expiration)
 
     def delete(self, session):
         key = self.build_key(session.sid)
@@ -115,6 +114,7 @@ class RedisSessionStore(SessionStore):
         session.sid = self.generate_key()
         if session.uid and env:
             session.session_token = security.compute_session_token(session, env)
+        session.should_rotate = False
         self.save(session)
 
     def vacuum(self, *args, **kwargs):
