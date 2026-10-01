@@ -428,12 +428,11 @@ class IrAttachment(models.Model):
         processed = 0
         with self.do_in_new_env(new_cr=new_cr) as new_env:
             model_env = new_env["ir.attachment"]
+            order = "checksum, id"
             if num_attachments:
-                ids = model_env.search(
-                    domain, limit=num_attachments, order="checksum, id"
-                ).ids
+                ids = model_env.search(domain, limit=num_attachments, order=order).ids
             else:
-                ids = model_env.search(domain, order="checksum, id").ids
+                ids = model_env.search(domain, order=order).ids
             if not ids:
                 return False
             files_to_clean = {}
@@ -464,9 +463,10 @@ class IrAttachment(models.Model):
                             fname, path = file_to_clean
                             files_to_clean[fname] = path
                         attachment.invalidate_recordset(["store_fname"])
-                        if attachment.store_fname and attachment.store_fname.startswith(
-                            f"{storage}://"
-                        ):
+                        if (
+                            attachment.store_fname
+                            and attachment.store_fname.startswith(f"{storage}://")
+                        ) or attachment.db_datas:
                             processed += 1
                 except Exception as error:
                     error_message = str(error) or repr(error)
